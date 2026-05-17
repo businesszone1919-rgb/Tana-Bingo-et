@@ -1,0 +1,400 @@
+import os
+import math
+import random
+import hmac
+import hashlib
+import json
+import asyncio
+from urllib.parse import parse_qs
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import HTMLResponse, JSONResponse
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# ===== [CONFIG] =====
+TOKEN = os.getenv("TELEGRAM_TOKEN", "8543538788:AAEn7RA41UhNq_vrS53uZP-ApK75yfruCi4") 
+BASE_URL = os.getenv("BASE_URL", "https://your-app-name.onrender.com") 
+
+app = FastAPI(title="Tana Bingo Live Mini App")
+
+telegram_app = Application.builder().token(TOKEN).build()
+bot = telegram_app.bot
+
+# የቢዝነስ ዳታቤዝ ማስመሰያ (In-Memory Simulation)
+USER_WALLETS = {}  
+LIVE_GAME = {
+    "game_id": "TANA-777",
+    "players_count": 584,
+    "derash_pool": 5840.0, # 584 ተጫዋች * 10 ብር
+    "status": "WAITING",   # WAITING, PLAYING, FINISHED
+    "drawn_numbers": [],
+    "current_number": "-"
+}
+
+# ===== [TELEGRAM BOT] =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "ተጫዋች"
+    
+    if user_id not in USER_WALLETS:
+        USER_WALLETS[user_id] = 500.0  # ለሙከራ 500 ብር ስጦታ
+        
+    web_app_url = f"{BASE_URL}/game-page"
+    keyboard = [[InlineKeyboardButton("Play Tana Bingo 🎮", web_app=WebAppInfo(url=web_app_url))]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = (
+        f"እንኳን ወደ <b>ጣና ቢንጎ (Tana Bingo)</b> በሰላም መጡ፣ @{username}! 🌊\n\n"
+        f"🎁 የ <b>500.00 ነፃ ሳንቲም</b> ስጦታዎ ተጨምሯል።\n\n"
+        f"አሁኑኑ መጫወት ለመጀመር ከታች ያለውን ቁልፍ ይጫኑ፦"
+    )
+    await update.message.reply_html(welcome_text, reply_markup=reply_markup)
+
+telegram_app.add_handler(CommandHandler("start", start))
+
+# ===== [TELEGRAM SECURITY] =====
+def verify_telegram_init_data(init_data_str: str, bot_token: str) -> dict:
+    try:
+        if not init_data_str: return {}
+        parsed_data = parse_qs(init_data_str)
+        data_dict = {k: v[0] for k, v in parsed_data.items()}
+        if "hash" not in data_dict: return {}
+        received_hash = data_dict.pop("hash")
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(data_dict.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if calculated_hash == received_hash:
+            if "user" in data_dict: return json.loads(data_dict["user"])
+        return {}
+    except Exception: return {}
+
+# ===== [API ROUTES] =====
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, bot)
+        await telegram_app.process_update(update)
+        return {"status": "success"}
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+@app.get("/api/user-status")
+async def get_user_status(initData: str = Query(...)):
+    user_info = verify_telegram_init_data(initData, TOKEN)
+    if not user_info: raise HTTPException(status_code=401, detail="Unauthorized")
+    user_id = user_info.get("id")
+    balance = USER_WALLETS.get(user_id, 500.0)
+    USER_WALLETS[user_id] = balance
+    return {"name": user_info.get("first_name"), "balance": balance, "game_info": LIVE_GAME}
+
+@app.post("/api/buy-cartela")
+async def buy_cartela(request: Request):
+    body = await request.json()
+    user_info = verify_telegram_init_data(body.get("initData"), TOKEN)
+    if not user_info: raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    user_id = user_info.get("id")
+    cartela_no = int(body.get("cartela_no", 1))
+    
+    current_balance = USER_WALLETS.get(user_id, 500.0)
+    if current_balance < 10.0:
+        return JSONResponse(status_code=400, content={"success": False, "message": "በቂ የሂሳብ መጠን የለዎትም!"})
+        
+    USER_WALLETS[user_id] = current_balance - 10.0
+    
+    # ለካርታው ቁጥር ዩኒክ የቢንጎ ግሪድ ማመንጨት (Seed የተደረገው በካርታው ቁጥር ነው)
+    random.seed(cartela_no)
+    b = random.sample(range(1, 16), 5)
+    i = random.sample(range(16, 31), 5)
+    n = random.sample(range(31, 46), 5)
+    g = random.sample(range(46, 61), 5)
+    o = random.sample(range(61, 76), 5)
+    
+    grid = []
+    for r in range(5):
+        grid.extend([b[r], i[r], "⭐" if r == 2 else n[r], g[r], o[r]])
+        
+    random.seed() # Seedን መልሶ ነፃ ማድረግ
+    return {"success": True, "new_balance": USER_WALLETS[user_id], "card": grid}
+
+# ===== [FRONTEND UI - HTML/JS] =====
+@app.get("/game-page", response_class=HTMLResponse)
+async def game_page():
+    return """<!DOCTYPE html>
+<html lang="am">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tana Bingo Live</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        body { background-color: #0d0a1b; color: #fff; font-family: sans-serif; text-align: center; margin: 0; padding: 0; user-select: none; }
+        .header { background: linear-gradient(135deg, #1e1233, #0f091c); padding: 12px; color: #f1c40f; border-bottom: 2px solid #f1c40f; font-size: 20px; font-weight: bold; }
+        .top-stats { display: flex; justify-content: space-around; background: #151126; padding: 8px; font-size: 13px; color: #bbb; border-bottom: 1px solid #251e3d; }
+        .stat-val { color: #f1c40f; font-weight: bold; }
+        .container { padding: 15px; }
+        
+        /* 1. የካርታ መራጭ ገጽ ስታይል */
+        .cartela-selector { height: 220px; overflow-y: scroll; background: #151126; border: 1px solid #2c224d; border-radius: 8px; margin: 15px 0; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 10px; }
+        .cartela-btn { background: #251e3d; border: 1px solid #3d3163; color: white; padding: 12px 5px; font-weight: bold; border-radius: 5px; cursor: pointer; }
+        .cartela-btn.selected { background: #f1c40f; color: #000; border-color: #fff; }
+        
+        /* 2. የቀጥታ ዙር (Live Match) ስታይል */
+        .live-panel { display: none; background: #151126; padding: 15px; border-radius: 12px; border: 1px solid #2ecc71; }
+        .ball-display { font-size: 45px; font-weight: bold; color: #f1c40f; background: #251e3d; width: 90px; height: 90px; line-height: 90px; border-radius: 50%; margin: 10px auto; border: 3px solid #f1c40f; box-shadow: 0 0 15px rgba(241,196,15,0.4); }
+        .toggle-container { display: flex; justify-content: space-between; align-items: center; background: #251e3d; padding: 10px; border-radius: 6px; margin: 10px 0; }
+        
+        /* ቢንጎ ግሪድ */
+        .bingo-header { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-top: 10px; font-weight: bold; color: #e74c3c; font-size: 18px; }
+        .grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin: 5px 0; background: #1c1733; padding: 8px; border-radius: 8px; }
+        .cell { background: #fff; color: #2c3e50; padding: 12px 0; font-size: 16px; font-weight: bold; border-radius: 4px; cursor: pointer; }
+        .cell.marked { background: #2ecc71 !important; color: #fff !important; }
+        .cell.free { background: #f1c40f !important; color: #fff !important; }
+        
+        /* ማብሪያ ቶግል ስዊች */
+        .switch { position: relative; display: inline-block; width: 45px; height: 24px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #555; transition: .3s; border-radius: 24px; }
+        .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 4px; bottom: 4px; background-color: white; transition: .3s; border-radius: 50%; }
+        input:checked + .slider { background-color: #2ecc71; }
+        input:checked + .slider:before { transform: translateX(21px); }
+        
+        /* ፖፕ አፕ ማሸነፊያ ማስታወቂያ */
+        .popup { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); justify-content: center; align-items: center; z-index: 100; }
+        .popup-content { background: #251e3d; padding: 30px; border-radius: 15px; border: 2px solid #f1c40f; width: 80%; max-width: 300px; }
+        .btn-action { background: #e67e22; color: #fff; border: none; padding: 12px 30px; font-size: 15px; font-weight: bold; border-radius: 25px; cursor: pointer; width: 100%; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="header">🌊 ጣና ቢንጎ (Tana Bingo)</div>
+    <div class="top-stats">
+        <div>ID: <span id="game-id" class="stat-val">...</span></div>
+        <div>ተጫዋቾች: <span id="p-count" class="stat-val">0</span></div>
+        <div>ደራሽ: <span id="pool-count" class="stat-val" style="color:#2ecc71">0.00</span> ብር</div>
+    </div>
+
+    <div class="container">
+        <div id="selector-screen">
+            <h3 style="margin:5px 0; color:#bbb;">የካርታ ቁጥር ይምረጡ</h3>
+            <p style="font-size:12px; color:#e74c3c;">የመመዝገቢያ ቀሪ ሰዓት፦ <span id="reg-timer">45</span> ሰከንድ</p>
+            <div class="cartela-selector" id="cartela-list"></div>
+            <p style="font-size:14px;">የተመረጠው ካርታ፦ <span id="selected-no-display" class="stat-val">አልተመረጠም</span></p>
+            <button class="btn-action" id="pay-btn" onclick="confirmCartela()" disabled>ውርርድ አረጋግጥ (10 ብር)</button>
+        </div>
+
+        <div id="live-screen" class="live-panel">
+            <p style="margin:0; font-size:12px; color:#bbb;">አሁን የወጣው ቁጥር</p>
+            <div class="ball-display" id="live-ball">-</div>
+            
+            <div class="toggle-container">
+                <span style="font-size:14px; font-weight:bold;">አውቶማቲክ ማርከር (Auto)</span>
+                <label class="switch">
+                    <input type="checkbox" id="auto-toggle" checked>
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="bingo-header"><div>B</div><div>I</div><div>N</div><div>G</div><div>O</div></div>
+            <div class="grid" id="game-card"></div>
+            <p style="font-size:12px; color:#aaa; margin:5px 0;">Cartela No: <span id="active-cartela-id"></span></p>
+        </div>
+    </div>
+
+    <div class="popup" id="win-popup">
+        <div class="popup-content">
+            <h2 style="color:#f1c40f; margin:0 0 10px 0;">BINGO! 🎉</h2>
+            <p id="winner-text" style="font-size:15px;"></p>
+            <button class="btn-action" onclick="resetToNextRound()">ወደ ቀጣዩ ዙር 🔄</button>
+        </div>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+        const initData = tg.initData;
+        
+        let selectedCartela = null;
+        let myCardGrid = [];
+        let isAutoMarker = true;
+        let drawnPool = [];
+
+        // 1. መረጃዎችን ከሰርቨር መጫን
+        async function initApp() {
+            const resp = await fetch(`/api/user-status?initData=${encodeURIComponent(initData)}`);
+            const data = await resp.json();
+            
+            document.getElementById("game-id").innerText = data.game_info.game_id;
+            document.getElementById("p-count").innerText = data.game_info.players_count;
+            document.getElementById("pool-count").innerText = data.game_info.derash_pool.toFixed(2);
+            
+            // የካርታ ቁጥሮችን ዝርዝር ማመንጨት (1 - 600)
+            const listDiv = document.getElementById("cartela-list");
+            for(let i=1; i<=100; i++) { // ለሙከራ ያህል 100 ፍሬ
+                let btn = document.createElement("button");
+                btn.className = "cartela-btn";
+                btn.innerText = i;
+                btn.onclick = () => selectCartela(i, btn);
+                listDiv.appendChild(btn);
+            }
+            startRegistrationTimer();
+        }
+
+        function selectCartela(num, btn) {
+            document.querySelectorAll('.cartela-btn').forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+            selectedCartela = num;
+            document.getElementById("selected-no-display").innerText = "No. " + num;
+            document.getElementById("pay-btn").disabled = false;
+        }
+
+        // 2. ውርርድ መክፈል እና ካርታ መረከብ
+        async function confirmCartela() {
+            const resp = await fetch('/api/buy-cartela', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ initData: initData, cartela_no: selectedCartela })
+            });
+            const data = await resp.json();
+            if(!data.success) { alert(data.message); return; }
+            
+            myCardGrid = data.card;
+            document.getElementById("pay-btn").innerText = "ተመዝግበዋል! ጨዋታ መጠበቅ ላይ...";
+            document.getElementById("pay-btn").disabled = true;
+        }
+
+        // 3. የምዝገባ ሰዓት ቆጣሪ (45 ሰከንድ)
+        function startRegistrationTimer() {
+            let sec = 45;
+            let t = setInterval(() => {
+                sec--;
+                document.getElementById("reg-timer").innerText = sec;
+                if(sec <= 0) {
+                    clearInterval(t);
+                    switchToLiveMatch();
+                }
+            }, 1000);
+        }
+
+        // 4. ወደ ቀጥታ ዙር ጨዋታ (Live Mode) ገጽ መሸጋገር
+        function switchToLiveMatch() {
+            if(!selectedCartela) {
+                alert("በዚህ ዙር አልተመዘገቡም! እባክዎ ቀጣዩን ዙር ይጠብቁ።");
+                return;
+            }
+            document.getElementById("selector-screen").style.display = "none";
+            document.getElementById("live-screen").style.display = "block";
+            document.getElementById("active-cartela-id").innerText = selectedCartela;
+            
+            // ካርታውን መደርደር
+            renderLiveCard();
+            // የዕጣ ቁጥሮችን ማውጣት መጀመር
+            startLiveDraw();
+        }
+
+        function renderLiveCard() {
+            const gridDiv = document.getElementById("game-card");
+            gridDiv.innerHTML = "";
+            myCardGrid.forEach((val, idx) => {
+                let cell = document.createElement("div");
+                cell.className = "cell";
+                cell.innerText = val;
+                cell.id = `c-${idx}`;
+                if(idx === 12) cell.classList.add("free", "marked");
+                else {
+                    cell.onclick = () => {
+                        if(!document.getElementById("auto-toggle").checked) {
+                            cell.classList.toggle("marked");
+                            checkBingoWin();
+                        }
+                    };
+                }
+                gridDiv.appendChild(cell);
+            });
+        }
+
+        // 5. የቀጥታ ቁጥር ጥሪ ማሽን (Live Number Call Machine)
+        function startLiveDraw() {
+            let numbersPool = Array.from({length: 75}, (_, i) => i + 1);
+            let callCount = 0;
+            
+            let drawInterval = setInterval(() => {
+                if(callCount >= 20) { // 20 ቁጥር ሲወጣ ለምሳሌ ያህል ጨዋታው ያልቃል
+                    clearInterval(drawInterval);
+                    triggerWinnerAnnounce();
+                    return;
+                }
+                
+                let rIdx = Math.floor(Math.random() * numbersPool.length);
+                let drawn = numbersPool.splice(rIdx, 1)[0];
+                drawnPool.push(drawn);
+                
+                // ፊደል መለየት (B, I, N, G, O)
+                let prefix = "";
+                if(drawn<=15) prefix="B"; else if(drawn<=30) prefix="I"; else if(drawn<=45) prefix="N"; else if(drawn<=60) prefix="G"; else prefix="O";
+                
+                document.getElementById("live-ball").innerText = prefix + "-" + drawn;
+                
+                // አውቶማቲክ ማርከር በርቶ ከሆነ በራሱ ማርክ ያደርጋል
+                if(document.getElementById("auto-toggle").checked) {
+                    myCardGrid.forEach((num, idx) => {
+                        if(num === drawn) {
+                            document.getElementById(`c-${idx}`).classList.add("marked");
+                        }
+                    });
+                    checkBingoWin();
+                }
+                
+                callCount++;
+            }, 3000); // በየ 3 ሰከንዱ አዲስ ቁጥር ይወጣል
+        }
+
+        // 6. የቢንጎ ማሸነፊያ መስመር ህግ ማረጋገጫ
+        function checkBingoWin() {
+            const lines = [
+                [0,1,2,3,4], [5,6,7,8,9], [10,11,12,13,14], [15,16,17,18,19], [20,21,22,23,24], // አግድም
+                [0,5,10,15,20], [1,6,11,16,21], [2,7,12,17,22], [3,8,13,18,23], [4,9,14,19,24], // ቁልቁል
+                [0,6,12,18,24], [4,8,12,16,20] // ሰያፍ
+            ];
+            
+            for(let line of lines) {
+                let win = line.every(idx => {
+                    let c = document.getElementById(`c-${idx}`);
+                    return c && c.classList.contains("marked");
+                });
+                if(win) {
+                    triggerWinnerAnnounce(true); // እኛ ካሸነፍን
+                    return;
+                }
+            }
+        }
+
+        // 7. የአሸናፊ ማስታወቂያ (Winner Pop-up)
+        function triggerWinnerAnnounce(isMe = false) {
+            const popup = document.getElementById("win-popup");
+            const txt = document.getElementById("winner-text");
+            if(isMe) {
+                txt.innerHTML = `🏆 <b>እንኳን ደስ አሎት!</b><br>በካርታ ቁጥር <b>${selectedCartela}</b> ቢንጎ ብለው አሸንፈዋል!<br><span style='color:#2ecc71'>ሽልማት፦ 5840.00 ብር</span>`;
+            } else {
+                txt.innerHTML = `🏁 <b>ዙሩ ተጠናቋል!</b><br>አሸናፊ፡ <b>Tewodros</b><br>የአሸናፊ ካርታ ቁጥር፡ <b>385</b>`;
+            }
+            popup.style.display = "flex";
+        }
+
+        function resetToNextRound() {
+            location.reload();
+        }
+
+        window.onload = initApp;
+    </script>
+</body>
+</html>"""
+
+# ===== [STARTUP HANDLER] =====
+@app.on_event("startup")
+async def on_startup():
+    await bot.set_webhook(url=f"{BASE_URL}/webhook")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
